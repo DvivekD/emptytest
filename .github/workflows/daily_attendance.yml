@@ -1,0 +1,71 @@
+name: VTU Campus.Life Autonomous Multi-Event Engine
+
+on:
+  schedule:
+    # 09:00 AM IST is 03:30 AM UTC (Runs Monday through Saturday)
+    - cron: '30 3 * * 1-6'
+    # 05:00 PM IST is 11:30 AM UTC (Runs Monday through Saturday)
+    - cron: '30 11 * * 1-6'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose action to run manually'
+        required: true
+        default: 'checkin'
+        type: choice
+        options:
+          - checkin
+          - checkout
+          - status
+
+permissions:
+  contents: write
+
+jobs:
+  run-attendance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Determine Action based on Schedule or Manual Trigger
+        id: determine_action
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+            echo "jitter=false" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" -lt "08" ]; then
+              echo "action=checkin" >> $GITHUB_OUTPUT
+            else
+              echo "action=checkout" >> $GITHUB_OUTPUT
+            fi
+            echo "jitter=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Execute Campus.Life Runner
+        run: |
+          ACTION="${{ steps.determine_action.outputs.action }}"
+          JITTER_FLAG=""
+          if [ "${{ steps.determine_action.outputs.jitter }}" = "true" ]; then
+            JITTER_FLAG="--jitter"
+          fi
+          
+          python campus_life_auto.py --action "$ACTION" $JITTER_FLAG
+
+      - name: Print Current Event Queue Status
+        run: |
+          python campus_life_auto.py --action status
+
+      - name: Commit and Persist Progress
+        run: |
+          git config --global user.name "VTU Attendance Bot"
+          git config --global user.email "bot@vtu-attendance.local"
+          git add events_db.json attendance_state.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update event progress [skip ci]" && git push)
