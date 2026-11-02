@@ -2,10 +2,10 @@ name: VTU Campus.Life Autonomous Multi-Event Engine
 
 on:
   schedule:
-    # 09:00 AM IST is 03:30 AM UTC (Runs Monday through Saturday)
-    - cron: '30 3 * * 1-6'
-    # 05:00 PM IST is 11:30 AM UTC (Runs Monday through Saturday)
-    - cron: '30 11 * * 1-6'
+    # 08:55 AM IST is 03:25 AM UTC (Off-peak minute prevents GitHub queue delays)
+    - cron: '25 3 * * 1-6'
+    # 05:05 PM IST is 11:35 AM UTC (Off-peak minute prevents GitHub queue delays)
+    - cron: '35 11 * * 1-6'
   workflow_dispatch:
     inputs:
       action:
