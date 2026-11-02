@@ -2,18 +2,17 @@ name: VTU Campus.Life Autonomous Multi-Event Engine
 
 on:
   schedule:
-    # 08:55 AM IST is 03:25 AM UTC (Off-peak minute prevents GitHub queue delays)
-    - cron: '25 3 * * 1-6'
-    # 05:05 PM IST is 11:35 AM UTC (Off-peak minute prevents GitHub queue delays)
-    - cron: '35 11 * * 1-6'
+    # Test schedule (triggers at 04:58 UTC = 10:28 AM IST)
+    - cron: '58 4 * * *'
   workflow_dispatch:
     inputs:
       action:
-        description: 'Choose action to run manually'
+        description: 'Choose action to run'
         required: true
-        default: 'checkin'
+        default: 'test_5min'
         type: choice
         options:
+          - test_5min
           - checkin
           - checkout
           - status
@@ -33,39 +32,39 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Determine Action based on Schedule or Manual Trigger
+      - name: Determine Action
         id: determine_action
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
-            echo "jitter=false" >> $GITHUB_OUTPUT
           else
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" -lt "08" ]; then
-              echo "action=checkin" >> $GITHUB_OUTPUT
-            else
-              echo "action=checkout" >> $GITHUB_OUTPUT
-            fi
-            echo "jitter=true" >> $GITHUB_OUTPUT
+            echo "action=test_5min" >> $GITHUB_OUTPUT
           fi
 
-      - name: Execute Campus.Life Runner
+      - name: Execute Autonomous Test (Check-In -> Wait 5 Mins -> Check-Out)
+        if: steps.determine_action.outputs.action == 'test_5min'
+        run: |
+          echo "=== STEP 1: EXECUTING CHECK-IN ==="
+          python campus_life_auto.py --action checkin
+          
+          echo "=== STEP 2: WAITING 5 MINUTES (300 SECONDS) IN THE CLOUD ==="
+          sleep 300
+          
+          echo "=== STEP 3: EXECUTING CHECK-OUT ==="
+          python campus_life_auto.py --action checkout
+          
+          echo "=== STEP 4: PRINTING FINAL STATUS ==="
+          python campus_life_auto.py --action status
+
+      - name: Execute Single Action (checkin/checkout/status)
+        if: steps.determine_action.outputs.action != 'test_5min'
         run: |
           ACTION="${{ steps.determine_action.outputs.action }}"
-          JITTER_FLAG=""
-          if [ "${{ steps.determine_action.outputs.jitter }}" = "true" ]; then
-            JITTER_FLAG="--jitter"
-          fi
-          
-          python campus_life_auto.py --action "$ACTION" $JITTER_FLAG
-
-      - name: Print Current Event Queue Status
-        run: |
-          python campus_life_auto.py --action status
+          python campus_life_auto.py --action "$ACTION"
 
       - name: Commit and Persist Progress
         run: |
           git config --global user.name "VTU Attendance Bot"
           git config --global user.email "bot@vtu-attendance.local"
           git add events_db.json attendance_state.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update event progress [skip ci]" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update event progress" && git push)
