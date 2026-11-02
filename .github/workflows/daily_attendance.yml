@@ -74,6 +74,9 @@ jobs:
         run: |
           git config --global user.name "VTU Attendance Bot"
           git config --global user.email "bot@vtu-attendance.local"
-          git pull --rebase origin main
           git add events_db.json attendance_state.json
-          git diff --staged --quiet || (git commit -m "Auto-update event progress" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update event progress"
+            git pull --rebase origin main
+            git push
+          fi
