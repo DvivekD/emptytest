@@ -3,10 +3,12 @@
 Campus.Life (VTU APTS) Smart Multi-Event Autonomous Attendance Engine
 ====================================================================
 Features:
+- Multi-pulse cron schedule for 100% cloud execution guarantee.
+- Direct database verification endpoint to check official server logs.
 - Earliest-Deadline-First (EDF) event priority scheduling.
 - Automatic event switching once 80 hours target is achieved.
-- Daily check-in (9:00 AM) & check-out (5:00 PM) with human jitter.
-- Idempotent execution (prevents duplicate check-ins or check-outs on the same day).
+- Daily check-in (9:00 AM window) & check-out (5:00 PM window).
+- Idempotent execution (skips duplicates on the same day).
 - Resilient network retry with exponential backoff.
 - Persistent state tracking across cloud runs.
 """
@@ -29,6 +31,7 @@ DEFAULT_RIDER_ID = "1894897"
 SUB_DEPS_URL = "https://cykul.in/app/lifeCykul/webservice/departments/subDepartments.php"
 SCAN_URL = "https://cykul.in/app/lifeCykul/webservice/scanning/scanActivities.php"
 USER_AGENT = "CampusLife/1 CFNetwork/3896.200.61 Darwin/27.2.0"
+VERIFY_URL = "https://vtuapts.zdotapps.in/apiv1/events/checkinandcheckoutdatatable/"
 
 
 def log(msg: str):
@@ -61,11 +64,6 @@ def save_state(state):
 
 
 def get_prioritized_event():
-    """
-    Selects the highest-priority event:
-    1. Filter: active == true and completed_hours < target_hours.
-    2. Sort: Earliest deadline first (ascending), then closest to 80 hrs (descending).
-    """
     events = load_events()
     candidates = [
         e for e in events
@@ -89,9 +87,6 @@ def get_prioritized_event():
 
 
 def resolve_department_ids(event_id: str, rider_id: str = DEFAULT_RIDER_ID):
-    """
-    Queries subDepartments.php to get exact Checkin and Checkout department IDs.
-    """
     payload = {
         "eventID": event_id,
         "riderID": rider_id,
@@ -133,9 +128,6 @@ def resolve_department_ids(event_id: str, rider_id: str = DEFAULT_RIDER_ID):
 
 
 def send_scan_request(event, action: str, department_id: str):
-    """
-    Submits scanActivities.php with automatic retry.
-    """
     now = datetime.datetime.now()
     formatted_time = now.strftime("%Y-%b-%d %H:%M")
 
@@ -214,7 +206,7 @@ def do_checkin(jitter: bool = False, force: bool = False):
         return
 
     if jitter:
-        delay = random.randint(120, 480)
+        delay = random.randint(60, 240)
         log(f"Jitter: Pausing for {delay // 60}m {delay % 60}s before Check-In...")
         time.sleep(delay)
 
@@ -253,7 +245,7 @@ def do_checkout(jitter: bool = False, force: bool = False):
         return
 
     if jitter:
-        delay = random.randint(120, 480)
+        delay = random.randint(60, 240)
         log(f"Jitter: Pausing for {delay // 60}m {delay % 60}s before Check-Out...")
         time.sleep(delay)
 
@@ -292,6 +284,51 @@ def do_checkout(jitter: bool = False, force: bool = False):
         save_state(state)
 
 
+def verify_official_server_logs():
+    """
+    Directly queries the VTU APTS server database to verify officially recorded attendance history.
+    """
+    log("Connecting to official VTU APTS server database...")
+    event = get_prioritized_event()
+    event_id = event["event_id"] if event else "CLCYOE6023260722105630242"
+
+    payload = {
+        "eventID": event_id,
+        "search": "SAI VIVEK",
+        "page": 1,
+        "length": 5
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        VERIFY_URL,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            records = res.get("data", [])
+            print("\n" + "=" * 90)
+            print(" OFFICIAL VTU APTS DATABASE VERIFICATION (DIRECT FROM SERVER)")
+            print("=" * 90)
+            print(f"{'Student Name':<18} {'Check-In Time':<22} {'Check-Out Time':<22} {'Status'}")
+            print("-" * 90)
+
+            for r in records[:5]:
+                name = r.get("firstName", "") + " " + r.get("lastName", "")
+                ci = r.get("checkinTime") or "Not Checked In"
+                co = r.get("checkoutTime") or "In Progress"
+                status = "COMPLETED" if r.get("checkoutTime") else "IN PROGRESS"
+                print(f"{name:<18} {ci:<22} {co:<22} {status}")
+
+            print("=" * 90 + "\n")
+            return True
+    except Exception as e:
+        log(f"Verification error: {e}")
+        return False
+
+
 def print_status():
     events = load_events()
     active_cand = get_prioritized_event()
@@ -324,12 +361,14 @@ def print_status():
 
 def main():
     parser = argparse.ArgumentParser(description="Campus.Life Autonomous Multi-Event Engine")
-    parser.add_argument("--action", choices=["checkin", "checkout", "status"], required=True)
-    parser.add_argument("--jitter", action="store_true", help="Add random human delay (2-8 min)")
+    parser.add_argument("--action", choices=["checkin", "checkout", "status", "verify"], required=True)
+    parser.add_argument("--jitter", action="store_true", help="Add random human delay")
     parser.add_argument("--force", action="store_true", help="Force action even if already done today")
     args = parser.parse_args()
 
-    if args.action == "status":
+    if args.action == "verify":
+        verify_official_server_logs()
+    elif args.action == "status":
         print_status()
     elif args.action == "checkin":
         do_checkin(jitter=args.jitter, force=args.force)
