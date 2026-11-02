@@ -6,7 +6,8 @@ Features:
 - Earliest-Deadline-First (EDF) event priority scheduling.
 - Automatic event switching once 80 hours target is achieved.
 - Daily check-in (9:00 AM) & check-out (5:00 PM) with human jitter.
-- Dynamic department ID resolution via subDepartments.php.
+- Idempotent execution (prevents duplicate check-ins or check-outs on the same day).
+- Resilient network retry with exponential backoff.
 - Persistent state tracking across cloud runs.
 """
 
@@ -80,7 +81,6 @@ def get_prioritized_event():
             deadline = datetime.date.fromisoformat(deadline_str)
         except Exception:
             deadline = datetime.date(9999, 12, 31)
-        # Sort primary by deadline (earliest first), secondary by remaining hours (least remaining first)
         remaining = e.get("target_hours", 80.0) - e.get("completed_hours", 0)
         return (deadline, remaining)
 
@@ -105,34 +105,36 @@ def resolve_department_ids(event_id: str, rider_id: str = DEFAULT_RIDER_ID):
         headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT}
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            res_json = json.loads(resp.read().decode("utf-8"))
-            checkin_id = None
-            checkout_id = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                checkin_id = None
+                checkout_id = None
 
-            for dept in res_json.get("resultStatus", []):
-                dept_name = dept.get("name", "").strip().lower()
-                tabs_order = dept.get("tabsOrder", "").strip().lower()
-                d_id = dept.get("departmentID", "")
+                for dept in res_json.get("resultStatus", []):
+                    dept_name = dept.get("name", "").strip().lower()
+                    tabs_order = dept.get("tabsOrder", "").strip().lower()
+                    d_id = dept.get("departmentID", "")
 
-                if "checkin" in dept_name or "checkin" in tabs_order or d_id.startswith("CHEKIN"):
-                    checkin_id = d_id
-                elif "checkout" in dept_name or "checkout" in tabs_order or d_id.startswith("CHEKOUT"):
-                    checkout_id = d_id
+                    if "checkin" in dept_name or "checkin" in tabs_order or d_id.startswith("CHEKIN"):
+                        checkin_id = d_id
+                    elif "checkout" in dept_name or "checkout" in tabs_order or d_id.startswith("CHEKOUT"):
+                        checkout_id = d_id
 
-            if checkin_id and checkout_id:
-                return checkin_id, checkout_id
-    except Exception as e:
-        log(f"Dynamic resolution error: {e}. Falling back to default pattern...")
+                if checkin_id and checkout_id:
+                    return checkin_id, checkout_id
+        except Exception as e:
+            log(f"Attempt {attempt}/3 error resolving departments: {e}")
+            if attempt < 3:
+                time.sleep(attempt * 3)
 
-    # Pattern fallback
     return "CHEKIN6023YOE602", "CHEKOUT6023YOE602"
 
 
 def send_scan_request(event, action: str, department_id: str):
     """
-    Submits scanActivities.php.
+    Submits scanActivities.php with automatic retry.
     """
     now = datetime.datetime.now()
     formatted_time = now.strftime("%Y-%b-%d %H:%M")
@@ -159,17 +161,53 @@ def send_scan_request(event, action: str, department_id: str):
         headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT}
     )
 
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8")
+                log(f"Server Response: {body}")
+                return True
+        except Exception as e:
+            log(f"Attempt {attempt}/3 error submitting {action}: {e}")
+            if attempt < 3:
+                time.sleep(attempt * 4)
+
+    return False
+
+
+def is_already_checked_in_today(state):
+    checkin_ts = state.get("checkin_timestamp")
+    current_eid = state.get("current_event_id")
+    if not checkin_ts or not current_eid:
+        return False
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8")
-            log(f"Server Response: {body}")
-            return True
-    except Exception as e:
-        log(f"Error submitting {action}: {e}")
+        c_date = datetime.datetime.fromisoformat(checkin_ts).date()
+        today = datetime.datetime.now().date()
+        return c_date == today
+    except Exception:
         return False
 
 
-def do_checkin(jitter: bool = False):
+def is_already_checked_out_today(state):
+    checkout_ts = state.get("last_checkout_timestamp")
+    current_eid = state.get("current_event_id")
+    if not checkout_ts or current_eid is not None:
+        return False
+    try:
+        co_date = datetime.datetime.fromisoformat(checkout_ts).date()
+        today = datetime.datetime.now().date()
+        return co_date == today
+    except Exception:
+        return False
+
+
+def do_checkin(jitter: bool = False, force: bool = False):
+    state = load_state()
+
+    if not force and is_already_checked_in_today(state):
+        log(f"Notice: Already checked in for today ({state.get('checkin_timestamp')}). Skipping duplicate.")
+        return
+
     event = get_prioritized_event()
     if not event:
         log("No eligible events found in database! All completed or none active.")
@@ -184,17 +222,20 @@ def do_checkin(jitter: bool = False):
     success = send_scan_request(event, "checkin", checkin_id)
 
     if success:
-        state = load_state()
         state["current_event_id"] = event["event_id"]
         state["checkin_timestamp"] = datetime.datetime.now().isoformat()
         save_state(state)
         log(f"Check-In registered for event [{event['name']}].")
 
 
-def do_checkout(jitter: bool = False):
+def do_checkout(jitter: bool = False, force: bool = False):
     state = load_state()
-    active_event_id = state.get("current_event_id")
 
+    if not force and is_already_checked_out_today(state):
+        log(f"Notice: Already checked out for today ({state.get('last_checkout_timestamp')}). Skipping duplicate.")
+        return
+
+    active_event_id = state.get("current_event_id")
     events = load_events()
     target_event = None
 
@@ -220,7 +261,6 @@ def do_checkout(jitter: bool = False):
     success = send_scan_request(target_event, "checkout", checkout_id)
 
     if success:
-        # Calculate session hours
         checkin_time_str = state.get("checkin_timestamp")
         added_hours = 8.0
         if checkin_time_str:
@@ -229,23 +269,22 @@ def do_checkout(jitter: bool = False):
                 elapsed = (datetime.datetime.now() - c_time).total_seconds() / 3600.0
                 if elapsed < 0.2:
                     added_hours = 0.0
-                    log(f"Session was under 12 minutes ({round(elapsed * 60, 1)}m). Adding 0.0 hrs to progress counter.")
+                    log(f"Session under 12 min ({round(elapsed * 60, 1)}m). Adding 0.0 hrs to counter.")
                 elif 0.2 <= elapsed <= 12.0:
                     added_hours = round(elapsed, 1)
             except Exception:
                 pass
 
-        # Update event hours
         target_event["completed_hours"] = round(target_event.get("completed_hours", 0) + added_hours, 1)
-        log(f"Added +{added_hours} hrs. Progress: {target_event['completed_hours']} / {target_event.get('target_hours', 80.0)} hrs.")
+        log(f"Added +{added_hours} hrs. Total Progress: {target_event['completed_hours']} / {target_event.get('target_hours', 80.0)} hrs.")
 
         if target_event["completed_hours"] >= target_event.get("target_hours", 80.0):
             log(f"🎉 TARGET REACHED for [{target_event['name']}] ({target_event['completed_hours']} hrs)!")
             next_event = get_prioritized_event()
             if next_event and next_event["event_id"] != target_event["event_id"]:
-                log(f"➡️ Automatically switching tomorrow to next priority event: [{next_event['name']}]")
+                log(f"➡️ Automatically switching tomorrow to next priority: [{next_event['name']}]")
             else:
-                log("All queued events in database are now complete!")
+                log("All queued events in database are complete!")
 
         save_events(events)
         state["last_checkout_timestamp"] = datetime.datetime.now().isoformat()
@@ -256,7 +295,6 @@ def do_checkout(jitter: bool = False):
 def print_status():
     events = load_events()
     active_cand = get_prioritized_event()
-    state = load_state()
 
     print("\n" + "=" * 80)
     print(" VTU CAMPUS.LIFE EVENT PROGRESS & PRIORITY QUEUE")
@@ -285,17 +323,18 @@ def print_status():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Campus.Life Multi-Event Autonomous Attendance")
+    parser = argparse.ArgumentParser(description="Campus.Life Autonomous Multi-Event Engine")
     parser.add_argument("--action", choices=["checkin", "checkout", "status"], required=True)
     parser.add_argument("--jitter", action="store_true", help="Add random human delay (2-8 min)")
+    parser.add_argument("--force", action="store_true", help="Force action even if already done today")
     args = parser.parse_args()
 
     if args.action == "status":
         print_status()
     elif args.action == "checkin":
-        do_checkin(jitter=args.jitter)
+        do_checkin(jitter=args.jitter, force=args.force)
     elif args.action == "checkout":
-        do_checkout(jitter=args.jitter)
+        do_checkout(jitter=args.jitter, force=args.force)
 
 
 if __name__ == "__main__":
