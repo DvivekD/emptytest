@@ -13,14 +13,16 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Choose action to run manually'
+        description: 'Action to run (auto chooses checkin in AM, checkout in PM)'
         required: true
-        default: 'checkin'
+        default: 'auto'
         type: choice
         options:
+          - auto
           - checkin
           - checkout
           - status
+          - verify
 
 permissions:
   contents: write
@@ -42,10 +44,8 @@ jobs:
       - name: Determine Action based on UTC Hour
         id: determine_action
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
-            echo "jitter=false" >> $GITHUB_OUTPUT
-          else
+          INPUT_ACTION="${{ github.event.inputs.action }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "$INPUT_ACTION" = "auto" ] || [ -z "$INPUT_ACTION" ]; then
             HOUR=$(date -u +%H)
             if [ "$HOUR" -lt "08" ]; then
               echo "action=checkin" >> $GITHUB_OUTPUT
@@ -53,6 +53,9 @@ jobs:
               echo "action=checkout" >> $GITHUB_OUTPUT
             fi
             echo "jitter=true" >> $GITHUB_OUTPUT
+          else
+            echo "action=$INPUT_ACTION" >> $GITHUB_OUTPUT
+            echo "jitter=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Execute Campus.Life Autonomous Runner
@@ -69,6 +72,10 @@ jobs:
       - name: Print Current Progress
         run: |
           python campus_life_auto.py --action status
+
+      - name: Verify Against Official VTU Database
+        run: |
+          python campus_life_auto.py --action verify
 
       - name: Commit and Persist Progress
         run: |
